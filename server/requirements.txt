@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+websockets
+livekit-api
+python-dotenv
+fastapi-cors
