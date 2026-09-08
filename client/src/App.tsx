@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveKitRoom, VideoConference } from "@livekit/components-react";
 
 const LIVEKIT_URL =
@@ -6,15 +6,19 @@ const LIVEKIT_URL =
 const TOKEN_ENDPOINT =
   import.meta.env.VITE_API_URL ?? "http://localhost:8000/getToken";
 
-const ROOM_CODE_ALPHABET = "abcdefghijkmnopqrstuvwxyz23456789";
+const NAME_STORAGE_KEY = "lk-display-name";
+const DEFAULT_HOST_NAME = "Love Kumar Todawat";
+const ROOM_CODE_ALPHABET = "abcdefghijkmnopqrstuvwxyz";
 
-function randomRoomName(length = 9) {
-  const bytes = new Uint8Array(length);
+/** Nine letters, grouped Meet-style as `abc-def-ghi`. */
+function randomRoomName() {
+  const bytes = new Uint8Array(9);
   crypto.getRandomValues(bytes);
-  return Array.from(
+  const letters = Array.from(
     bytes,
     (b) => ROOM_CODE_ALPHABET[b % ROOM_CODE_ALPHABET.length],
   ).join("");
+  return `${letters.slice(0, 3)}-${letters.slice(3, 6)}-${letters.slice(6, 9)}`;
 }
 
 /** A room in the URL (?room=...) is an invite: it is locked in and cannot be edited. */
@@ -22,35 +26,128 @@ function roomFromUrl() {
   return new URLSearchParams(window.location.search).get("room");
 }
 
+function storedName() {
+  try {
+    return localStorage.getItem(NAME_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function rememberName(name: string) {
+  try {
+    localStorage.setItem(NAME_STORAGE_KEY, name);
+  } catch {
+    // Private-mode browsers can refuse writes; remembering the name is optional.
+  }
+}
+
+/** Accepts a bare code, a full invite URL, or anything with a `room` query param. */
+function parseRoomInput(raw: string) {
+  const value = raw.trim();
+  if (!value) return "";
+
+  if (value.includes("://") || value.includes("?room=")) {
+    try {
+      const url = new URL(value, window.location.origin);
+      const room = url.searchParams.get("room");
+      if (room) return room.trim();
+      const lastSegment = url.pathname.split("/").filter(Boolean).pop();
+      if (lastSegment) return lastSegment;
+    } catch {
+      // Not a parseable URL; fall through and use the raw value as a code.
+    }
+  }
+  return value;
+}
+
+function inviteLinkFor(room: string) {
+  return window.location.origin + "?room=" + encodeURIComponent(room.trim());
+}
+
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // The async clipboard API needs a secure context; fall back to a selection copy.
+    const el = document.createElement("textarea");
+    el.value = text;
+    document.body.appendChild(el);
+    el.select();
+    document.execCommand("copy");
+    document.body.removeChild(el);
+  }
+}
+
+type View = "dashboard" | "prep";
+
 export default function App() {
   const invitedRoom = useMemo(roomFromUrl, []);
   const isInvited = Boolean(invitedRoom);
 
-  const [roomName, setRoomName] = useState(() => invitedRoom ?? randomRoomName());
-  const [userName, setUserName] = useState("Love Kumar Todawat");
+  // An invite link skips the dashboard and lands straight on the prep view.
+  const [view, setView] = useState<View>(isInvited ? "prep" : "dashboard");
+  const [roomName, setRoomName] = useState(() => invitedRoom ?? "");
+  const [userName, setUserName] = useState(
+    // Guests arriving on an invite link get a blank field; the host gets a default.
+    () => storedName() ?? (isInvited ? "" : DEFAULT_HOST_NAME),
+  );
+
   const [token, setToken] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState("");
-  const [copied, setCopied] = useState(false);
 
-  const inviteLink =
-    window.location.origin + "?room=" + encodeURIComponent(roomName.trim());
+  const [joinCode, setJoinCode] = useState("");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [laterRoom, setLaterRoom] = useState<string | null>(null);
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
-  const copyInviteLink = useCallback(async () => {
-    try {
-      await navigator.clipboard.writeText(inviteLink);
-    } catch {
-      // The async clipboard API needs a secure context; fall back to a selection copy.
-      const el = document.createElement("textarea");
-      el.value = inviteLink;
-      document.body.appendChild(el);
-      el.select();
-      document.execCommand("copy");
-      document.body.removeChild(el);
-    }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [inviteLink]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [menuOpen]);
+
+  const goToPrep = useCallback((room: string) => {
+    setRoomName(room);
+    setError("");
+    setMenuOpen(false);
+    setView("prep");
+  }, []);
+
+  const handleCreateForLater = useCallback(() => {
+    setLaterRoom(randomRoomName());
+    setMenuOpen(false);
+  }, []);
+
+  const handleInstantMeeting = useCallback(() => {
+    goToPrep(randomRoomName());
+  }, [goToPrep]);
+
+  const handleJoinByCode = useCallback(
+    (event: React.FormEvent) => {
+      event.preventDefault();
+      const room = parseRoomInput(joinCode);
+      if (!room) {
+        setError("Enter a meeting code or invite link.");
+        return;
+      }
+      goToPrep(room);
+    },
+    [joinCode, goToPrep],
+  );
 
   const handleJoin = useCallback(
     async (event: React.FormEvent) => {
@@ -78,6 +175,7 @@ export default function App() {
         if (!data?.token) {
           throw new Error("Token server did not return a token.");
         }
+        rememberName(participant);
         setToken(data.token);
       } catch (err) {
         setError(
@@ -90,117 +188,451 @@ export default function App() {
     [roomName, userName],
   );
 
+  const leaveRoom = useCallback(() => {
+    setToken(null);
+    // An invited guest has nowhere to go back to but their own prep view.
+    setView(isInvited ? "prep" : "dashboard");
+  }, [isInvited]);
+
   if (token) {
     return (
-      <LiveKitRoom
-        video
-        audio
-        connect
-        token={token}
-        serverUrl={LIVEKIT_URL}
-        data-lk-theme="default"
-        style={{ height: "100dvh" }}
-        onDisconnected={() => setToken(null)}
-        onError={(err) => {
-          setError(err.message);
-          setToken(null);
-        }}
-      >
-        <VideoConference />
-      </LiveKitRoom>
+      <div className="relative h-dvh w-full bg-[#0a0a0c]">
+        <LiveKitRoom
+          video
+          audio
+          connect
+          token={token}
+          serverUrl={LIVEKIT_URL}
+          data-lk-theme="default"
+          style={{ height: "100dvh" }}
+          onDisconnected={leaveRoom}
+          onError={(err) => {
+            setError(err.message);
+            leaveRoom();
+          }}
+        >
+          <VideoConference />
+        </LiveKitRoom>
+
+        {/* Floats above the LiveKit video grid, clear of its centred control bar. */}
+        <div className="pointer-events-none absolute bottom-4 left-4 z-50">
+          <CopyLinkPill room={roomName} />
+        </div>
+      </div>
     );
   }
 
   return (
-    <div className="relative flex min-h-dvh w-full flex-col items-center justify-center overflow-hidden bg-[#0a0a0c] px-4 py-12">
-      {/* Ambient background wash */}
-      <div className="pointer-events-none absolute inset-0">
-        <div className="absolute left-1/2 top-[-18rem] h-[36rem] w-[36rem] -translate-x-1/2 rounded-full bg-indigo-500/20 blur-[140px]" />
-        <div className="absolute bottom-[-16rem] right-[-10rem] h-[32rem] w-[32rem] rounded-full bg-sky-500/10 blur-[140px]" />
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_35%,#0a0a0c_100%)]" />
-      </div>
+    <div className="relative flex min-h-dvh w-full flex-col overflow-hidden bg-[#0a0a0c]">
+      <Backdrop />
 
-      <main className="relative z-10 w-full max-w-md animate-fade-up">
-        <div className="rounded-3xl border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] p-8 shadow-2xl backdrop-blur-xl">
-          <div className="flex flex-col items-center">
-            <span className="relative mb-5 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/10 shadow-lg">
-              <span className="absolute inset-0 animate-pulse-ring rounded-2xl border border-indigo-400/40" />
-              <CameraIcon />
-            </span>
-            <h1 className="text-center text-2xl font-semibold tracking-tight text-white">
-              {isInvited ? "You are invited to a meeting" : "Start a secure meeting"}
-            </h1>
-            <p className="mt-2 text-center text-sm text-zinc-400">
-              {isInvited
-                ? "Enter your name to join the room below."
-                : "Share the invite link to bring others into your room."}
-            </p>
-          </div>
+      <header className="relative z-10 flex items-center gap-2.5 px-6 py-5 sm:px-10">
+        <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-white/10 bg-white/10">
+          <CameraIcon />
+        </span>
+        <span className="text-[15px] font-medium tracking-tight text-zinc-200">
+          LiveKit Meet
+        </span>
+      </header>
 
-          <form onSubmit={handleJoin} className="mt-8 flex flex-col gap-4">
-            <Field label="Room">
-              <input
-                value={roomName}
-                onChange={(e) => setRoomName(e.target.value)}
-                readOnly={isInvited}
-                aria-readonly={isInvited}
-                spellCheck={false}
-                placeholder="room-name"
-                className={[
-                  "w-full rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3 font-mono text-sm text-white",
-                  "placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30",
-                  isInvited ? "cursor-not-allowed text-zinc-300 opacity-80" : "",
-                ].join(" ")}
-              />
-              {isInvited && (
-                <p className="mt-1.5 text-xs text-zinc-500">
-                  Locked to the room from your invite link.
-                </p>
-              )}
-            </Field>
+      <main className="relative z-10 flex flex-1 items-center justify-center px-4 pb-16 sm:px-10">
+        {view === "dashboard" ? (
+          <Dashboard
+            joinCode={joinCode}
+            setJoinCode={setJoinCode}
+            onJoinByCode={handleJoinByCode}
+            menuOpen={menuOpen}
+            setMenuOpen={setMenuOpen}
+            menuRef={menuRef}
+            onCreateForLater={handleCreateForLater}
+            onInstantMeeting={handleInstantMeeting}
+            error={error}
+          />
+        ) : (
+          <PrepView
+            roomName={roomName}
+            setRoomName={setRoomName}
+            userName={userName}
+            setUserName={setUserName}
+            isInvited={isInvited}
+            connecting={connecting}
+            error={error}
+            onJoin={handleJoin}
+            onBack={isInvited ? undefined : () => setView("dashboard")}
+          />
+        )}
+      </main>
 
-            <Field label="Your name">
-              <input
-                value={userName}
-                onChange={(e) => setUserName(e.target.value)}
-                autoFocus
-                placeholder="Your name"
-                className="w-full rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3 text-sm text-white placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30"
-              />
-            </Field>
+      {laterRoom && (
+        <ShareModal room={laterRoom} onClose={() => setLaterRoom(null)} />
+      )}
+    </div>
+  );
+}
 
-            {error && (
-              <p
-                role="alert"
-                className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300"
-              >
-                {error}
-              </p>
-            )}
+/* ---------------------------------------------------------------- dashboard */
 
-            <button
-              type="submit"
-              disabled={connecting}
-              className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60 disabled:cursor-not-allowed disabled:opacity-60"
+function Dashboard({
+  joinCode,
+  setJoinCode,
+  onJoinByCode,
+  menuOpen,
+  setMenuOpen,
+  menuRef,
+  onCreateForLater,
+  onInstantMeeting,
+  error,
+}: {
+  joinCode: string;
+  setJoinCode: (v: string) => void;
+  onJoinByCode: (e: React.FormEvent) => void;
+  menuOpen: boolean;
+  setMenuOpen: (v: boolean) => void;
+  menuRef: React.RefObject<HTMLDivElement | null>;
+  onCreateForLater: () => void;
+  onInstantMeeting: () => void;
+  error: string;
+}) {
+  return (
+    <div className="w-full max-w-3xl animate-fade-up">
+      <h1 className="text-balance text-center text-4xl font-semibold tracking-tight text-white sm:text-5xl">
+        Video calls, built on LiveKit
+      </h1>
+      <p className="mx-auto mt-4 max-w-xl text-center text-base text-zinc-400">
+        Start a meeting in one click, or join with a code someone shared with you.
+      </p>
+
+      <div className="mt-10 flex flex-col items-stretch gap-4 sm:flex-row sm:items-start sm:justify-center">
+        {/* New meeting + dropdown */}
+        <div ref={menuRef} className="relative sm:w-auto">
+          <button
+            type="button"
+            onClick={() => setMenuOpen(!menuOpen)}
+            aria-haspopup="menu"
+            aria-expanded={menuOpen}
+            className="flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-5 py-3.5 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60 sm:w-auto"
+          >
+            <PlusIcon />
+            New meeting
+            <ChevronIcon open={menuOpen} />
+          </button>
+
+          {menuOpen && (
+            <div
+              role="menu"
+              className="absolute left-0 right-0 z-30 mt-2 overflow-hidden rounded-xl border border-white/10 bg-[#141418] p-1.5 shadow-2xl sm:right-auto sm:w-80"
             >
-              {connecting ? "Connecting..." : "Join meeting"}
-            </button>
-
-            <button
-              type="button"
-              onClick={copyInviteLink}
-              className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-5 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
-            >
-              <LinkIcon />
-              {copied ? "Invite link copied" : "Copy invite link"}
-            </button>
-          </form>
+              <MenuItem
+                icon={<LinkIcon />}
+                title="Create a meeting for later"
+                description="Get a link you can share now and use anytime"
+                onClick={onCreateForLater}
+              />
+              <MenuItem
+                icon={<CameraIcon />}
+                title="Start an instant meeting"
+                description="Create a room and join it right away"
+                onClick={onInstantMeeting}
+              />
+            </div>
+          )}
         </div>
 
-        <p className="mt-6 text-center text-xs text-zinc-600">
-          Powered by LiveKit Cloud
+        {/* Join by code */}
+        <form onSubmit={onJoinByCode} className="flex flex-1 gap-2 sm:max-w-md">
+          <div className="relative flex-1">
+            <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-500">
+              <KeyboardIcon />
+            </span>
+            <input
+              value={joinCode}
+              onChange={(e) => setJoinCode(e.target.value)}
+              placeholder="Enter a code or link"
+              spellCheck={false}
+              aria-label="Meeting code or link"
+              className="w-full rounded-xl border border-white/10 bg-white/[0.06] py-3.5 pl-11 pr-4 text-sm text-white placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30"
+            />
+          </div>
+          <button
+            type="submit"
+            disabled={!joinCode.trim()}
+            className="rounded-xl px-5 py-3.5 text-sm font-medium text-indigo-300 transition hover:bg-white/[0.06] focus:outline-none focus:ring-2 focus:ring-indigo-400/40 disabled:cursor-not-allowed disabled:text-zinc-600 disabled:hover:bg-transparent"
+          >
+            Join
+          </button>
+        </form>
+      </div>
+
+      {error && (
+        <p role="alert" className="mt-5 text-center text-sm text-red-300">
+          {error}
         </p>
-      </main>
+      )}
+    </div>
+  );
+}
+
+function MenuItem({
+  icon,
+  title,
+  description,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  title: string;
+  description: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className="flex w-full items-start gap-3 rounded-lg px-3 py-3 text-left transition hover:bg-white/[0.07] focus:bg-white/[0.07] focus:outline-none"
+    >
+      <span className="mt-0.5 shrink-0 text-zinc-400">{icon}</span>
+      <span className="flex flex-col gap-0.5">
+        <span className="text-sm font-medium text-zinc-100">{title}</span>
+        <span className="text-xs text-zinc-500">{description}</span>
+      </span>
+    </button>
+  );
+}
+
+/* ----------------------------------------------------------------- prep view */
+
+function PrepView({
+  roomName,
+  setRoomName,
+  userName,
+  setUserName,
+  isInvited,
+  connecting,
+  error,
+  onJoin,
+  onBack,
+}: {
+  roomName: string;
+  setRoomName: (v: string) => void;
+  userName: string;
+  setUserName: (v: string) => void;
+  isInvited: boolean;
+  connecting: boolean;
+  error: string;
+  onJoin: (e: React.FormEvent) => void;
+  onBack?: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const copyInvite = useCallback(async () => {
+    await copyText(inviteLinkFor(roomName));
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  }, [roomName]);
+
+  return (
+    <div className="w-full max-w-md animate-fade-up">
+      <div className="rounded-3xl border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] p-8 shadow-2xl backdrop-blur-xl">
+        <div className="flex flex-col items-center">
+          <span className="relative mb-5 flex h-14 w-14 items-center justify-center rounded-2xl border border-white/10 bg-white/10 shadow-lg">
+            <span className="absolute inset-0 animate-pulse-ring rounded-2xl border border-indigo-400/40" />
+            <CameraIcon />
+          </span>
+          <h1 className="text-center text-2xl font-semibold tracking-tight text-white">
+            {isInvited ? "You are invited to a meeting" : "Ready to join?"}
+          </h1>
+          <p className="mt-2 text-center text-sm text-zinc-400">
+            {isInvited
+              ? "Enter your name to join the room below."
+              : "Share the invite link to bring others into your room."}
+          </p>
+        </div>
+
+        <form onSubmit={onJoin} className="mt-8 flex flex-col gap-4">
+          <Field label="Room">
+            <input
+              value={roomName}
+              onChange={(e) => setRoomName(e.target.value)}
+              readOnly={isInvited}
+              aria-readonly={isInvited}
+              spellCheck={false}
+              placeholder="room-name"
+              className={[
+                "w-full rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3 font-mono text-sm text-white",
+                "placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30",
+                isInvited ? "cursor-not-allowed text-zinc-300 opacity-80" : "",
+              ].join(" ")}
+            />
+            {isInvited && (
+              <p className="mt-1.5 text-xs text-zinc-500">
+                Locked to the room from your invite link.
+              </p>
+            )}
+          </Field>
+
+          <Field label="Your name">
+            <input
+              value={userName}
+              onChange={(e) => setUserName(e.target.value)}
+              autoFocus
+              placeholder="Your name"
+              className="w-full rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3 text-sm text-white placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30"
+            />
+          </Field>
+
+          {error && (
+            <p
+              role="alert"
+              className="rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-sm text-red-300"
+            >
+              {error}
+            </p>
+          )}
+
+          <button
+            type="submit"
+            disabled={connecting}
+            className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {connecting ? "Connecting..." : "Join meeting"}
+          </button>
+
+          <button
+            type="button"
+            onClick={copyInvite}
+            className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 bg-white/[0.04] px-5 py-3 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
+          >
+            <LinkIcon />
+            {copied ? "Invite link copied" : "Copy invite link"}
+          </button>
+        </form>
+      </div>
+
+      {onBack && (
+        <button
+          type="button"
+          onClick={onBack}
+          className="mx-auto mt-5 block text-sm text-zinc-500 transition hover:text-zinc-300"
+        >
+          &larr; Back to home
+        </button>
+      )}
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- in-call UI */
+
+function CopyLinkPill({ room }: { room: string }) {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = useCallback(async () => {
+    await copyText(window.location.origin + "?room=" + room);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  }, [room]);
+
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      aria-live="polite"
+      className={[
+        "pointer-events-auto flex items-center gap-2 rounded-full border px-4 py-2.5 text-sm font-medium",
+        "backdrop-blur-md transition focus:outline-none focus:ring-2 focus:ring-white/30",
+        copied
+          ? "border-emerald-400/30 bg-emerald-500/20 text-emerald-200"
+          : "border-white/15 bg-black/50 text-zinc-100 hover:bg-black/70",
+      ].join(" ")}
+    >
+      {copied ? <CheckIcon /> : <LinkIcon />}
+      {copied ? "Copied!" : "Copy link"}
+    </button>
+  );
+}
+
+/* ---------------------------------------------------------------- share modal */
+
+function ShareModal({ room, onClose }: { room: string; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const link = inviteLinkFor(room);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
+
+  const onCopy = useCallback(async () => {
+    await copyText(link);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 2000);
+  }, [link]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Your meeting link"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-md animate-fade-up rounded-2xl border border-white/10 bg-[#141418] p-6 shadow-2xl"
+      >
+        <h2 className="text-lg font-semibold text-white">
+          Here is your joining info
+        </h2>
+        <p className="mt-2 text-sm text-zinc-400">
+          Send this link to people you want in the meeting. Save it &mdash; you can
+          use it anytime.
+        </p>
+
+        <div className="mt-5 flex items-center gap-2 rounded-xl border border-white/10 bg-white/[0.05] px-4 py-3">
+          <span className="flex-1 truncate font-mono text-sm text-zinc-200">
+            {link}
+          </span>
+          <button
+            type="button"
+            onClick={onCopy}
+            className={[
+              "shrink-0 rounded-lg px-3 py-1.5 text-xs font-medium transition focus:outline-none focus:ring-2 focus:ring-indigo-400/40",
+              copied
+                ? "bg-emerald-500/20 text-emerald-200"
+                : "bg-indigo-500/20 text-indigo-200 hover:bg-indigo-500/30",
+            ].join(" ")}
+          >
+            {copied ? "Copied!" : "Copy"}
+          </button>
+        </div>
+
+        <p className="mt-4 text-xs text-zinc-500">
+          Meeting code: <span className="font-mono text-zinc-300">{room}</span>
+        </p>
+
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-6 w-full rounded-xl border border-white/10 bg-white/[0.04] px-5 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* -------------------------------------------------------------- shared bits */
+
+function Backdrop() {
+  return (
+    <div className="pointer-events-none absolute inset-0">
+      <div className="absolute left-1/2 top-[-18rem] h-[36rem] w-[36rem] -translate-x-1/2 rounded-full bg-indigo-500/20 blur-[140px]" />
+      <div className="absolute bottom-[-16rem] right-[-10rem] h-[32rem] w-[32rem] rounded-full bg-sky-500/10 blur-[140px]" />
+      <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,transparent_35%,#0a0a0c_100%)]" />
     </div>
   );
 }
@@ -225,8 +657,8 @@ function Field({
 function CameraIcon() {
   return (
     <svg
-      width="24"
-      height="24"
+      width="20"
+      height="20"
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
@@ -255,6 +687,76 @@ function LinkIcon() {
     >
       <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
       <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M20 6 9 17l-5-5" />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M12 5v14M5 12h14" />
+    </svg>
+  );
+}
+
+function ChevronIcon({ open }: { open: boolean }) {
+  return (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`transition-transform ${open ? "rotate-180" : ""}`}
+    >
+      <path d="m6 9 6 6 6-6" />
+    </svg>
+  );
+}
+
+function KeyboardIcon() {
+  return (
+    <svg
+      width="16"
+      height="16"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect width="20" height="14" x="2" y="5" rx="2" />
+      <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h8" />
     </svg>
   );
 }
