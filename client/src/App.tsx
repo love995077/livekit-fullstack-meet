@@ -1,5 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { LiveKitRoom, VideoConference } from "@livekit/components-react";
+import { LiveKitRoom } from "@livekit/components-react";
+
+import MeetingStage from "./components/MeetingStage";
+import { useMeetingSocket, type MeetingMessage } from "./lib/useMeetingSocket";
+import { createWhiteboardBus } from "./lib/whiteboardBus";
 
 const LIVEKIT_URL =
   import.meta.env.VITE_LIVEKIT_URL ?? "wss://video-meet-4jll05v3.livekit.cloud";
@@ -79,7 +83,7 @@ async function copyText(text: string) {
   }
 }
 
-type View = "dashboard" | "prep";
+type View = "dashboard" | "prep" | "waiting";
 
 export default function App() {
   const invitedRoom = useMemo(roomFromUrl, []);
@@ -93,14 +97,87 @@ export default function App() {
     () => storedName() ?? (isInvited ? "" : DEFAULT_HOST_NAME),
   );
 
+  // Whoever creates the meeting hosts it; everyone else has to ask to join.
+  const [isHost, setIsHost] = useState(false);
+
   const [token, setToken] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   const [joinCode, setJoinCode] = useState("");
   const [menuOpen, setMenuOpen] = useState(false);
   const [laterRoom, setLaterRoom] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+
+  // Guests waiting on the host, seen from the host's side.
+  const [knocks, setKnocks] = useState<string[]>([]);
+
+  const bus = useMemo(createWhiteboardBus, []);
+
+  const fetchToken = useCallback(async (room: string, participant: string) => {
+    const url = new URL(TOKEN_ENDPOINT, window.location.origin);
+    url.searchParams.set("room_name", room);
+    url.searchParams.set("participant_name", participant);
+
+    const response = await fetch(url.toString());
+    if (!response.ok) {
+      throw new Error(`Token server responded with ${response.status}`);
+    }
+    const data = await response.json();
+    if (!data?.token) {
+      throw new Error("Token server did not return a token.");
+    }
+    return data.token as string;
+  }, []);
+
+  const handleSocketMessage = useCallback(
+    (message: MeetingMessage) => {
+      switch (message.type) {
+        case "knock": {
+          const who = String(message.name ?? "Someone");
+          setKnocks((prev) => (prev.includes(who) ? prev : [...prev, who]));
+          break;
+        }
+        case "decision": {
+          if (message.approved) {
+            setNotice("");
+            fetchToken(roomName.trim(), userName.trim())
+              .then((t) => {
+                rememberName(userName.trim());
+                setToken(t);
+              })
+              .catch((err) =>
+                setError(
+                  err instanceof Error ? err.message : "Could not fetch a token.",
+                ),
+              );
+          } else {
+            setView("prep");
+            setError("The host denied your request to join.");
+          }
+          break;
+        }
+        case "waiting": {
+          if (message.reason === "host_absent") {
+            setNotice("The host has not joined yet. You will be let in once they do.");
+          }
+          break;
+        }
+        case "whiteboard_update": {
+          bus.publish(message.data);
+          break;
+        }
+        case "whiteboard_clear": {
+          bus.publish([]);
+          break;
+        }
+      }
+    },
+    [bus, fetchToken, roomName, userName],
+  );
+
+  const socket = useMeetingSocket({ onMessage: handleSocketMessage });
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -120,9 +197,11 @@ export default function App() {
     };
   }, [menuOpen]);
 
-  const goToPrep = useCallback((room: string) => {
+  const goToPrep = useCallback((room: string, asHost: boolean) => {
     setRoomName(room);
+    setIsHost(asHost);
     setError("");
+    setNotice("");
     setMenuOpen(false);
     setView("prep");
   }, []);
@@ -133,7 +212,7 @@ export default function App() {
   }, []);
 
   const handleInstantMeeting = useCallback(() => {
-    goToPrep(randomRoomName());
+    goToPrep(randomRoomName(), true);
   }, [goToPrep]);
 
   const handleJoinByCode = useCallback(
@@ -144,9 +223,30 @@ export default function App() {
         setError("Enter a meeting code or invite link.");
         return;
       }
-      goToPrep(room);
+      goToPrep(room, false);
     },
     [joinCode, goToPrep],
+  );
+
+  /** Host: open signaling, then join LiveKit straight away. */
+  const startAsHost = useCallback(
+    async (room: string, participant: string) => {
+      await socket.connect(room, participant, "host");
+      const t = await fetchToken(room, participant);
+      rememberName(participant);
+      setToken(t);
+    },
+    [fetchToken, socket],
+  );
+
+  /** Guest: knock and wait. No token is requested until the host approves. */
+  const askToJoin = useCallback(
+    async (room: string, participant: string) => {
+      await socket.connect(room, participant, "guest");
+      socket.send({ type: "knock", name: participant });
+      setView("waiting");
+    },
+    [socket],
   );
 
   const handleJoin = useCallback(
@@ -161,38 +261,47 @@ export default function App() {
       }
 
       setError("");
+      setNotice("");
       setConnecting(true);
       try {
-        const url = new URL(TOKEN_ENDPOINT, window.location.origin);
-        url.searchParams.set("room_name", room);
-        url.searchParams.set("participant_name", participant);
-
-        const response = await fetch(url.toString());
-        if (!response.ok) {
-          throw new Error(`Token server responded with ${response.status}`);
+        if (isHost) {
+          await startAsHost(room, participant);
+        } else {
+          await askToJoin(room, participant);
         }
-        const data = await response.json();
-        if (!data?.token) {
-          throw new Error("Token server did not return a token.");
-        }
-        rememberName(participant);
-        setToken(data.token);
       } catch (err) {
         setError(
-          err instanceof Error ? err.message : "Could not reach the token server.",
+          err instanceof Error ? err.message : "Could not reach the meeting server.",
         );
       } finally {
         setConnecting(false);
       }
     },
-    [roomName, userName],
+    [askToJoin, isHost, roomName, startAsHost, userName],
+  );
+
+  const decide = useCallback(
+    (name: string, approved: boolean) => {
+      socket.send({ type: "decision", name, approved });
+      setKnocks((prev) => prev.filter((n) => n !== name));
+    },
+    [socket],
   );
 
   const leaveRoom = useCallback(() => {
     setToken(null);
+    setKnocks([]);
+    bus.reset();
+    socket.disconnect();
     // An invited guest has nowhere to go back to but their own prep view.
     setView(isInvited ? "prep" : "dashboard");
-  }, [isInvited]);
+  }, [bus, isInvited, socket]);
+
+  const cancelWaiting = useCallback(() => {
+    socket.disconnect();
+    setNotice("");
+    setView("prep");
+  }, [socket]);
 
   if (token) {
     return (
@@ -211,13 +320,21 @@ export default function App() {
             leaveRoom();
           }}
         >
-          <VideoConference />
+          <MeetingStage roomName={roomName} bus={bus} send={socket.send} />
         </LiveKitRoom>
 
-        {/* Floats above the LiveKit video grid, clear of its centred control bar. */}
-        <div className="pointer-events-none absolute bottom-4 left-4 z-50">
-          <CopyLinkPill room={roomName} />
-        </div>
+        {isHost && knocks.length > 0 && (
+          <div className="fixed bottom-4 right-4 z-50 flex flex-col gap-2">
+            {knocks.map((name) => (
+              <KnockToast
+                key={name}
+                name={name}
+                onAdmit={() => decide(name, true)}
+                onDeny={() => decide(name, false)}
+              />
+            ))}
+          </div>
+        )}
       </div>
     );
   }
@@ -236,7 +353,7 @@ export default function App() {
       </header>
 
       <main className="relative z-10 flex flex-1 items-center justify-center px-4 pb-16 sm:px-10">
-        {view === "dashboard" ? (
+        {view === "dashboard" && (
           <Dashboard
             joinCode={joinCode}
             setJoinCode={setJoinCode}
@@ -248,23 +365,43 @@ export default function App() {
             onInstantMeeting={handleInstantMeeting}
             error={error}
           />
-        ) : (
+        )}
+
+        {view === "prep" && (
           <PrepView
             roomName={roomName}
             setRoomName={setRoomName}
             userName={userName}
             setUserName={setUserName}
             isInvited={isInvited}
+            isHost={isHost}
             connecting={connecting}
             error={error}
             onJoin={handleJoin}
             onBack={isInvited ? undefined : () => setView("dashboard")}
           />
         )}
+
+        {view === "waiting" && (
+          <WaitingRoom
+            roomName={roomName}
+            userName={userName}
+            notice={notice}
+            onCancel={cancelWaiting}
+          />
+        )}
       </main>
 
       {laterRoom && (
-        <ShareModal room={laterRoom} onClose={() => setLaterRoom(null)} />
+        <ShareModal
+          room={laterRoom}
+          onClose={() => setLaterRoom(null)}
+          onJoinNow={() => {
+            const room = laterRoom;
+            setLaterRoom(null);
+            goToPrep(room, true);
+          }}
+        />
       )}
     </div>
   );
@@ -407,6 +544,7 @@ function PrepView({
   userName,
   setUserName,
   isInvited,
+  isHost,
   connecting,
   error,
   onJoin,
@@ -417,6 +555,7 @@ function PrepView({
   userName: string;
   setUserName: (v: string) => void;
   isInvited: boolean;
+  isHost: boolean;
   connecting: boolean;
   error: string;
   onJoin: (e: React.FormEvent) => void;
@@ -430,6 +569,8 @@ function PrepView({
     window.setTimeout(() => setCopied(false), 2000);
   }, [roomName]);
 
+  const joinLabel = isHost ? "Join meeting" : "Ask to Join";
+
   return (
     <div className="w-full max-w-md animate-fade-up">
       <div className="rounded-3xl border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] p-8 shadow-2xl backdrop-blur-xl">
@@ -439,12 +580,12 @@ function PrepView({
             <CameraIcon />
           </span>
           <h1 className="text-center text-2xl font-semibold tracking-tight text-white">
-            {isInvited ? "You are invited to a meeting" : "Ready to join?"}
+            {isHost ? "Ready to start?" : "Ask to join this meeting"}
           </h1>
           <p className="mt-2 text-center text-sm text-zinc-400">
-            {isInvited
-              ? "Enter your name to join the room below."
-              : "Share the invite link to bring others into your room."}
+            {isHost
+              ? "You are the host. Share the invite link to bring others in."
+              : "The host will be asked to let you in."}
           </p>
         </div>
 
@@ -494,7 +635,7 @@ function PrepView({
             disabled={connecting}
             className="mt-1 flex w-full items-center justify-center gap-2 rounded-xl bg-indigo-500 px-5 py-3 text-sm font-medium text-white shadow-lg shadow-indigo-500/20 transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60 disabled:cursor-not-allowed disabled:opacity-60"
           >
-            {connecting ? "Connecting..." : "Join meeting"}
+            {connecting ? "Connecting..." : joinLabel}
           </button>
 
           <button
@@ -521,39 +662,112 @@ function PrepView({
   );
 }
 
-/* --------------------------------------------------------------- in-call UI */
+/* --------------------------------------------------------------- waiting room */
 
-function CopyLinkPill({ room }: { room: string }) {
-  const [copied, setCopied] = useState(false);
-
-  const onCopy = useCallback(async () => {
-    await copyText(window.location.origin + "?room=" + room);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [room]);
-
+function WaitingRoom({
+  roomName,
+  userName,
+  notice,
+  onCancel,
+}: {
+  roomName: string;
+  userName: string;
+  notice: string;
+  onCancel: () => void;
+}) {
   return (
-    <button
-      type="button"
-      onClick={onCopy}
-      aria-live="polite"
-      className={[
-        "pointer-events-auto flex items-center gap-2 rounded-full border px-4 py-2.5 text-sm font-medium",
-        "backdrop-blur-md transition focus:outline-none focus:ring-2 focus:ring-white/30",
-        copied
-          ? "border-emerald-400/30 bg-emerald-500/20 text-emerald-200"
-          : "border-white/15 bg-black/50 text-zinc-100 hover:bg-black/70",
-      ].join(" ")}
+    <div className="w-full max-w-md animate-fade-up text-center">
+      <div className="rounded-3xl border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] p-10 shadow-2xl backdrop-blur-xl">
+        <span className="relative mx-auto mb-6 flex h-16 w-16 items-center justify-center rounded-full border border-white/10 bg-white/10">
+          <span className="absolute inset-0 animate-pulse-ring rounded-full border border-indigo-400/40" />
+          <span className="h-3 w-3 animate-pulse rounded-full bg-indigo-400" />
+        </span>
+
+        <h1 className="text-2xl font-semibold tracking-tight text-white">
+          Waiting for the host...
+        </h1>
+        <p className="mt-3 text-sm text-zinc-400">
+          We let the host know you are here. You will join automatically once you
+          are admitted.
+        </p>
+
+        {notice && (
+          <p className="mt-4 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+            {notice}
+          </p>
+        )}
+
+        <dl className="mt-6 space-y-1 text-xs text-zinc-500">
+          <div>
+            Room <span className="font-mono text-zinc-300">{roomName}</span>
+          </div>
+          <div>
+            Joining as <span className="text-zinc-300">{userName}</span>
+          </div>
+        </dl>
+
+        <button
+          type="button"
+          onClick={onCancel}
+          className="mt-7 w-full rounded-xl border border-white/10 bg-white/[0.04] px-5 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
+        >
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------- knock toast */
+
+function KnockToast({
+  name,
+  onAdmit,
+  onDeny,
+}: {
+  name: string;
+  onAdmit: () => void;
+  onDeny: () => void;
+}) {
+  return (
+    <div
+      role="alert"
+      className="w-80 animate-fade-up rounded-2xl border border-white/10 bg-[#16161b]/95 p-4 shadow-2xl backdrop-blur-md"
     >
-      {copied ? <CheckIcon /> : <LinkIcon />}
-      {copied ? "Copied!" : "Copy link"}
-    </button>
+      <p className="text-sm text-zinc-100">
+        <span className="font-medium">{name}</span> is asking to join
+      </p>
+      <div className="mt-3 flex gap-2">
+        <button
+          type="button"
+          onClick={onAdmit}
+          className="flex-1 rounded-lg bg-indigo-500 px-3 py-2 text-sm font-medium text-white transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60"
+        >
+          Admit
+        </button>
+        <button
+          type="button"
+          onClick={onDeny}
+          className="flex-1 rounded-lg border border-white/10 bg-white/[0.05] px-3 py-2 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.1] focus:outline-none focus:ring-2 focus:ring-white/20"
+        >
+          Deny
+        </button>
+      </div>
+    </div>
   );
 }
 
 /* ---------------------------------------------------------------- share modal */
 
-function ShareModal({ room, onClose }: { room: string; onClose: () => void }) {
+function ShareModal({
+  room,
+  onClose,
+  onJoinNow,
+}: {
+  room: string;
+  onClose: () => void;
+  onJoinNow: () => void;
+}) {
   const [copied, setCopied] = useState(false);
   const link = inviteLinkFor(room);
 
@@ -613,13 +827,22 @@ function ShareModal({ room, onClose }: { room: string; onClose: () => void }) {
           Meeting code: <span className="font-mono text-zinc-300">{room}</span>
         </p>
 
-        <button
-          type="button"
-          onClick={onClose}
-          className="mt-6 w-full rounded-xl border border-white/10 bg-white/[0.04] px-5 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
-        >
-          Done
-        </button>
+        <div className="mt-6 flex gap-2">
+          <button
+            type="button"
+            onClick={onJoinNow}
+            className="flex-1 rounded-xl bg-indigo-500 px-5 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60"
+          >
+            Start it now
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex-1 rounded-xl border border-white/10 bg-white/[0.04] px-5 py-2.5 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.08] focus:outline-none focus:ring-2 focus:ring-white/20"
+          >
+            Done
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -656,17 +879,7 @@ function Field({
 
 function CameraIcon() {
   return (
-    <svg
-      width="20"
-      height="20"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.7"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className="text-indigo-300"
-    >
+    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="text-indigo-300">
       <path d="m22 8-6 4 6 4V8Z" />
       <rect width="14" height="12" x="2" y="6" rx="2" ry="2" />
     </svg>
@@ -675,51 +888,16 @@ function CameraIcon() {
 
 function LinkIcon() {
   return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
       <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
     </svg>
   );
 }
 
-function CheckIcon() {
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2.2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M20 6 9 17l-5-5" />
-    </svg>
-  );
-}
-
 function PlusIcon() {
   return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M12 5v14M5 12h14" />
     </svg>
   );
@@ -745,16 +923,7 @@ function ChevronIcon({ open }: { open: boolean }) {
 
 function KeyboardIcon() {
   return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.8"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <rect width="20" height="14" x="2" y="5" rx="2" />
       <path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M8 13h8" />
     </svg>

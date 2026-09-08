@@ -25,3 +25,15 @@ body {
 .lk-room-container {
   height: 100%;
 }
+
+/* The in-call chat is opened from our own sidebar toggle, so hide the duplicate
+   toggle (and panel) that VideoConference renders in its control bar. */
+.lk-video-conference .lk-chat-toggle {
+  display: none;
+}
+
+/* tldraw needs a positioned, sized container to fill. */
+.tl-container {
+  position: absolute;
+  inset: 0;
+}
