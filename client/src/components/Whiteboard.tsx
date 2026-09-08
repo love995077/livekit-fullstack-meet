@@ -25,12 +25,30 @@ export default function Whiteboard({ bus, send }: Props) {
   const editorRef = useRef<Editor | null>(null);
   const cleanupRef = useRef<Array<() => void>>([]);
   const snapshotTimer = useRef<number | null>(null);
+  const unmountedRef = useRef(false);
+
+  const runCleanups = useCallback(() => {
+    const cleanups = cleanupRef.current;
+    cleanupRef.current = [];
+    for (const fn of cleanups) {
+      try {
+        fn();
+      } catch {
+        // A listener that is already detached must not block the rest.
+      }
+    }
+  }, []);
 
   const sendSnapshot = useCallback(() => {
+    snapshotTimer.current = null;
     const editor = editorRef.current;
-    if (!editor) return;
-    const records = Object.values(editor.store.serialize("document"));
-    send({ type: "whiteboard_update", data: records, snapshot: true });
+    if (!editor || unmountedRef.current) return;
+    try {
+      const records = Object.values(editor.store.serialize("document"));
+      send({ type: "whiteboard_update", data: records, snapshot: true });
+    } catch (err) {
+      console.error("Could not serialize the whiteboard:", err);
+    }
   }, [send]);
 
   const scheduleSnapshot = useCallback(() => {
@@ -42,24 +60,34 @@ export default function Whiteboard({ bus, send }: Props) {
 
   const applyRemote = useCallback((data: unknown) => {
     const editor = editorRef.current;
-    if (!editor || data == null) return;
+    if (!editor || data == null || unmountedRef.current) return;
 
-    editor.store.mergeRemoteChanges(() => {
-      if (Array.isArray(data)) {
-        // A full snapshot: every document record in one go.
-        editor.store.put(data as TLRecord[]);
-        return;
-      }
-      const diff = (data as { diff?: unknown }).diff;
-      if (diff && typeof diff === "object") {
-        editor.store.applyDiff(diff as Parameters<typeof editor.store.applyDiff>[0]);
-      }
-    });
+    try {
+      editor.store.mergeRemoteChanges(() => {
+        if (Array.isArray(data)) {
+          // A full snapshot: every document record in one go.
+          editor.store.put(data as TLRecord[]);
+          return;
+        }
+        const diff = (data as { diff?: unknown }).diff;
+        if (diff && typeof diff === "object") {
+          editor.store.applyDiff(
+            diff as Parameters<typeof editor.store.applyDiff>[0],
+          );
+        }
+      });
+    } catch (err) {
+      // A malformed or schema-mismatched payload must not kill the canvas.
+      console.error("Could not apply a remote whiteboard update:", err);
+    }
   }, []);
 
   const handleMount = useCallback(
     (editor: Editor) => {
+      // Guard against a second mount (StrictMode, remount) stacking listeners.
+      runCleanups();
       editorRef.current = editor;
+      unmountedRef.current = false;
 
       // Outgoing: only local user edits to document records.
       const unlisten = editor.store.listen(
@@ -76,20 +104,21 @@ export default function Whiteboard({ bus, send }: Props) {
 
       cleanupRef.current.push(unlisten, unsubscribe);
     },
-    [applyRemote, bus, scheduleSnapshot, send],
+    [applyRemote, bus, runCleanups, scheduleSnapshot, send],
   );
 
   useEffect(() => {
-    const cleanups = cleanupRef.current;
+    unmountedRef.current = false;
     return () => {
+      unmountedRef.current = true;
       if (snapshotTimer.current !== null) {
         window.clearTimeout(snapshotTimer.current);
+        snapshotTimer.current = null;
       }
-      cleanups.forEach((fn) => fn());
-      cleanups.length = 0;
+      runCleanups();
       editorRef.current = null;
     };
-  }, []);
+  }, [runCleanups]);
 
   return (
     <div className="absolute inset-0">

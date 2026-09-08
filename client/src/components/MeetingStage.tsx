@@ -1,6 +1,8 @@
 import { Suspense, lazy, useCallback, useState } from "react";
 import { Chat, VideoConference } from "@livekit/components-react";
 
+import ErrorBoundary from "./ErrorBoundary";
+import { useCopyFeedback } from "../lib/clipboard";
 import type { MeetingMessage } from "../lib/useMeetingSocket";
 import type { WhiteboardBus } from "../lib/whiteboardBus";
 
@@ -12,20 +14,6 @@ type Props = {
   send: (message: MeetingMessage) => boolean;
 };
 
-async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    // The async clipboard API needs a secure context; fall back to a selection copy.
-    const el = document.createElement("textarea");
-    el.value = text;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand("copy");
-    document.body.removeChild(el);
-  }
-}
-
 /**
  * Everything inside the LiveKit room: the prebuilt conference (grid, screen
  * share and chat plumbing), plus our chat sidebar, whiteboard and copy pill.
@@ -33,6 +21,15 @@ async function copyText(text: string) {
 export default function MeetingStage({ roomName, bus, send }: Props) {
   const [chatOpen, setChatOpen] = useState(false);
   const [boardOpen, setBoardOpen] = useState(false);
+  // Bumped on each open so a failed chunk load can be retried cleanly.
+  const [boardAttempt, setBoardAttempt] = useState(0);
+
+  const openBoard = useCallback(() => {
+    setBoardOpen((open) => {
+      if (!open) setBoardAttempt((n) => n + 1);
+      return !open;
+    });
+  }, []);
 
   return (
     <div className="flex h-dvh w-full bg-[#0a0a0c]">
@@ -41,9 +38,19 @@ export default function MeetingStage({ roomName, bus, send }: Props) {
 
         {boardOpen && (
           <div className="absolute inset-0 z-30 bg-[#0a0a0c]">
-            <Suspense fallback={<BoardLoading />}>
-              <Whiteboard bus={bus} send={send} />
-            </Suspense>
+            <ErrorBoundary
+              key={boardAttempt}
+              fallback={(_error, retry) => (
+                <BoardFailed
+                  onRetry={retry}
+                  onClose={() => setBoardOpen(false)}
+                />
+              )}
+            >
+              <Suspense fallback={<BoardMessage text="Loading whiteboard..." />}>
+                <Whiteboard bus={bus} send={send} />
+              </Suspense>
+            </ErrorBoundary>
           </div>
         )}
 
@@ -51,7 +58,7 @@ export default function MeetingStage({ roomName, bus, send }: Props) {
         <div className="absolute right-4 top-4 z-40 flex gap-2">
           <ToolbarButton
             active={boardOpen}
-            onClick={() => setBoardOpen((v) => !v)}
+            onClick={openBoard}
             label={boardOpen ? "Close whiteboard" : "Whiteboard"}
           >
             <PenIcon />
@@ -101,10 +108,42 @@ export default function MeetingStage({ roomName, bus, send }: Props) {
   );
 }
 
-function BoardLoading() {
+function BoardMessage({ text }: { text: string }) {
   return (
     <div className="flex h-full items-center justify-center text-sm text-zinc-400">
-      Loading whiteboard...
+      {text}
+    </div>
+  );
+}
+
+function BoardFailed({
+  onRetry,
+  onClose,
+}: {
+  onRetry: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="flex h-full flex-col items-center justify-center gap-4 px-6 text-center">
+      <p className="text-sm text-zinc-300">
+        The whiteboard could not be loaded. Your call is unaffected.
+      </p>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={onRetry}
+          className="rounded-xl bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition hover:bg-indigo-400 focus:outline-none focus:ring-2 focus:ring-indigo-400/60"
+        >
+          Try again
+        </button>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded-xl border border-white/10 bg-white/[0.05] px-4 py-2 text-sm font-medium text-zinc-200 transition hover:bg-white/[0.1] focus:outline-none focus:ring-2 focus:ring-white/20"
+        >
+          Back to call
+        </button>
+      </div>
     </div>
   );
 }
@@ -142,13 +181,11 @@ function ToolbarButton({
 }
 
 function CopyLinkPill({ room }: { room: string }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
 
-  const onCopy = useCallback(async () => {
-    await copyText(window.location.origin + "?room=" + room);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [room]);
+  const onCopy = useCallback(() => {
+    void copy(window.location.origin + "?room=" + room);
+  }, [copy, room]);
 
   return (
     <button

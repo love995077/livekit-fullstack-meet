@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LiveKitRoom } from "@livekit/components-react";
 
 import MeetingStage from "./components/MeetingStage";
+import { useCopyFeedback } from "./lib/clipboard";
+import { useMediaDevices } from "./lib/useMediaDevices";
 import { useMeetingSocket, type MeetingMessage } from "./lib/useMeetingSocket";
 import { createWhiteboardBus } from "./lib/whiteboardBus";
 
@@ -69,24 +71,10 @@ function inviteLinkFor(room: string) {
   return window.location.origin + "?room=" + encodeURIComponent(room.trim());
 }
 
-async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    // The async clipboard API needs a secure context; fall back to a selection copy.
-    const el = document.createElement("textarea");
-    el.value = text;
-    document.body.appendChild(el);
-    el.select();
-    document.execCommand("copy");
-    document.body.removeChild(el);
-  }
-}
-
 type View = "dashboard" | "prep" | "waiting";
 
 export default function App() {
-  const invitedRoom = useMemo(roomFromUrl, []);
+  const invitedRoom = useMemo(() => roomFromUrl(), []);
   const isInvited = Boolean(invitedRoom);
 
   // An invite link skips the dashboard and lands straight on the prep view.
@@ -113,7 +101,18 @@ export default function App() {
   // Guests waiting on the host, seen from the host's side.
   const [knocks, setKnocks] = useState<string[]>([]);
 
-  const bus = useMemo(createWhiteboardBus, []);
+  // Bumped when the host denies entry, which tears the guest socket down.
+  const [deniedAt, setDeniedAt] = useState(0);
+
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  // Missing hardware must not block joining: fall back to receive-only.
+  const { hasCamera, hasMic, checked: devicesChecked } = useMediaDevices();
+
+  const bus = useMemo(() => createWhiteboardBus(), []);
 
   const fetchToken = useCallback(async (room: string, participant: string) => {
     const url = new URL(TOKEN_ENDPOINT, window.location.origin);
@@ -153,6 +152,7 @@ export default function App() {
                 ),
               );
           } else {
+            setDeniedAt(Date.now());
             setView("prep");
             setError("The host denied your request to join.");
           }
@@ -177,7 +177,23 @@ export default function App() {
     [bus, fetchToken, roomName, userName],
   );
 
-  const socket = useMeetingSocket({ onMessage: handleSocketMessage });
+  const handleSocketClose = useCallback(() => {
+    setKnocks([]);
+    if (viewRef.current === "waiting") {
+      setView("prep");
+      setError("Lost connection to the meeting server. Please try again.");
+    }
+  }, []);
+
+  const socket = useMeetingSocket({
+    onMessage: handleSocketMessage,
+    onUnexpectedClose: handleSocketClose,
+  });
+  // `disconnect` is stable, so this only fires when a denial actually lands.
+  const { disconnect } = socket;
+  useEffect(() => {
+    if (deniedAt) disconnect();
+  }, [deniedAt, disconnect]);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -307,8 +323,8 @@ export default function App() {
     return (
       <div className="relative h-dvh w-full bg-[#0a0a0c]">
         <LiveKitRoom
-          video
-          audio
+          video={hasCamera}
+          audio={hasMic}
           connect
           token={token}
           serverUrl={LIVEKIT_URL}
@@ -375,6 +391,9 @@ export default function App() {
             setUserName={setUserName}
             isInvited={isInvited}
             isHost={isHost}
+            hasCamera={hasCamera}
+            hasMic={hasMic}
+            devicesChecked={devicesChecked}
             connecting={connecting}
             error={error}
             onJoin={handleJoin}
@@ -538,6 +557,17 @@ function MenuItem({
 
 /* ----------------------------------------------------------------- prep view */
 
+/** Explains what a participant will join with when hardware is missing. */
+function deviceNotice(hasCamera: boolean, hasMic: boolean) {
+  if (!hasCamera && !hasMic) {
+    return "No camera or microphone detected. You can still join to watch and listen.";
+  }
+  if (!hasCamera) {
+    return "No camera detected. You will join with audio only.";
+  }
+  return "No microphone detected. You will join with video only.";
+}
+
 function PrepView({
   roomName,
   setRoomName,
@@ -545,6 +575,9 @@ function PrepView({
   setUserName,
   isInvited,
   isHost,
+  hasCamera,
+  hasMic,
+  devicesChecked,
   connecting,
   error,
   onJoin,
@@ -556,18 +589,19 @@ function PrepView({
   setUserName: (v: string) => void;
   isInvited: boolean;
   isHost: boolean;
+  hasCamera: boolean;
+  hasMic: boolean;
+  devicesChecked: boolean;
   connecting: boolean;
   error: string;
   onJoin: (e: React.FormEvent) => void;
   onBack?: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
 
-  const copyInvite = useCallback(async () => {
-    await copyText(inviteLinkFor(roomName));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [roomName]);
+  const copyInvite = useCallback(() => {
+    void copy(inviteLinkFor(roomName));
+  }, [copy, roomName]);
 
   const joinLabel = isHost ? "Join meeting" : "Ask to Join";
 
@@ -620,6 +654,12 @@ function PrepView({
               className="w-full rounded-xl border border-white/10 bg-white/[0.06] px-4 py-3 text-sm text-white placeholder-zinc-500 outline-none transition focus:border-indigo-400/50 focus:ring-2 focus:ring-indigo-500/30"
             />
           </Field>
+
+          {devicesChecked && !(hasCamera && hasMic) && (
+            <p className="rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-sm text-amber-200">
+              {deviceNotice(hasCamera, hasMic)}
+            </p>
+          )}
 
           {error && (
             <p
@@ -768,7 +808,7 @@ function ShareModal({
   onClose: () => void;
   onJoinNow: () => void;
 }) {
-  const [copied, setCopied] = useState(false);
+  const { copied, copy } = useCopyFeedback();
   const link = inviteLinkFor(room);
 
   useEffect(() => {
@@ -779,11 +819,9 @@ function ShareModal({
     return () => document.removeEventListener("keydown", onKeyDown);
   }, [onClose]);
 
-  const onCopy = useCallback(async () => {
-    await copyText(link);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  }, [link]);
+  const onCopy = useCallback(() => {
+    void copy(link);
+  }, [copy, link]);
 
   return (
     <div
